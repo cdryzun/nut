@@ -57,6 +57,23 @@ TESTS += nuttimetest
 nuttimetest_SOURCES = nuttimetest.c
 nuttimetest_LDADD = $(top_builddir)/common/libcommon.la
 
+TESTS += huawei-ups2000-test
+huawei_ups2000_test_SOURCES = huawei-ups2000-test.c
+huawei_ups2000_test_CFLAGS = $(AM_CFLAGS) -I$(top_srcdir)/drivers
+
+if WITH_MODBUS
+TESTS += huawei-ups2000-driver-test
+huawei-ups2000-driver-test.c: $(top_srcdir)/drivers/huawei-ups2000.c
+huawei_ups2000_driver_test_SOURCES = huawei-ups2000-driver-test.c
+huawei_ups2000_driver_test_CFLAGS = $(AM_CFLAGS) $(LIBMODBUS_CFLAGS) -DDRIVERS_MAIN_WITHOUT_MAIN=1
+huawei_ups2000_driver_test_LDADD = $(top_builddir)/drivers/libdummy_serial.la \
+	$(top_builddir)/drivers/libdummy_mockdrv.la \
+	$(top_builddir)/common/libcommon.la $(top_builddir)/common/libparseconf.la \
+	$(LIBMODBUS_LIBS) $(SERLIBS)
+else !WITH_MODBUS
+EXTRA_DIST += huawei-ups2000-driver-test.c
+endif !WITH_MODBUS
+
 # Separate the .deps of other dirs from this one
 LINKED_SOURCE_FILES = hidparser.c
 
@@ -114,6 +131,7 @@ EXTRA_DIST += generic_gpio_utest.h generic_gpio_test.txt
 
 # Make sure out-of-dir dependencies exist (especially when dev-building parts):
 $(top_builddir)/drivers/libdummy_mockdrv.la \
+$(top_builddir)/drivers/libdummy_serial.la \
 $(top_builddir)/common/libnutconf.la \
 $(top_builddir)/common/libcommonclient.la \
 $(top_builddir)/common/libcommon.la: dummy

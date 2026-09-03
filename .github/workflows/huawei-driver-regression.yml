@@ -1,0 +1,87 @@
+name: Huawei UPS2000 regression
+
+on:
+  push:
+    branches:
+      - feat/huawei-ups2000-battery-register-resilience
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    if: github.repository == 'cdryzun/nut'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      NUT_PORT: 34931
+    steps:
+      - name: Check out the fork branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            autoconf automake build-essential libtool pkg-config \
+            libmodbus-dev libssl-dev libusb-1.0-0-dev \
+            libcppunit-dev libltdl-dev python3
+
+      - name: Generate build files
+        run: ./autogen.sh
+
+      - name: Configure an unprivileged, hardware-free test build
+        run: |
+          ./configure \
+            --with-drivers=huawei-ups2000,dummy-ups \
+            --with-modbus=yes \
+            --with-usb=yes \
+            --with-ssl=yes \
+            --with-openssl=yes \
+            --with-user="$(id -un)" \
+            --with-group="$(id -gn)" \
+            --with-dev=yes \
+            --enable-cppunit=yes \
+            --enable-check-NIT \
+            --without-doc
+
+      - name: Build
+        run: make -j2 all
+
+      - name: Prove the incident regression fails on the production baseline
+        run: |
+          patched_driver="$RUNNER_TEMP/huawei-ups2000-patched.c"
+          cp drivers/huawei-ups2000.c "$patched_driver"
+          trap 'cp "$patched_driver" drivers/huawei-ups2000.c' EXIT
+          git show 3e31b39796bfa2ec0d7fd551d58866e2de57d876:drivers/huawei-ups2000.c \
+            > drivers/huawei-ups2000.c
+          make -C tests huawei-ups2000-driver-test
+          set +e
+          tests/huawei-ups2000-driver-test > tests/huawei-ups2000-baseline.log 2>&1
+          baseline_result=$?
+          set -e
+          test "$baseline_result" -ne 0
+          grep -F 'FAIL: incident battery values do not make the UPS stale' \
+            tests/huawei-ups2000-baseline.log
+
+      - name: Rebuild the patched driver and regression tests
+        run: make -j2 all
+
+      - name: Run the complete configured test suite
+        run: make check
+
+      - name: Retain verification logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: huawei-ups2000-verification-logs
+          if-no-files-found: ignore
+          path: |
+            config.log
+            tests/test-suite.log
+            tests/*.log
+            tests/*.trs

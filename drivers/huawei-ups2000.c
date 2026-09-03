@@ -48,10 +48,11 @@
 #include "main.h"
 #include "serial.h"
 #include "nut_stdint.h"
+#include "huawei-ups2000-private.h"
 #include "timehead.h"   /* fallback gmtime_r() variants if needed (e.g. some WIN32) */
 
 #define DRIVER_NAME	"NUT Huawei UPS2000 (1kVA-3kVA) RS-232 Modbus driver"
-#define DRIVER_VERSION	"0.06"
+#define DRIVER_VERSION	"0.06-cdryzun1"
 
 #define CHECK_BIT(var,pos) ((var) & (1<<(pos)))
 #define MODBUS_SLAVE_ID 1
@@ -149,6 +150,9 @@ static time_t start_at = 0;
  */
 static bool bypass_available = 0;
 
+/* Battery faults can persist for many polls; avoid repeating the same warning. */
+static bool battery_data_degraded = false;
+
 /* function prototypes */
 static int ups2000_update_info(void);
 static int ups2000_update_status(void);
@@ -157,6 +161,7 @@ static int ups2000_update_timers(void);
 static void ups2000_device_identification(void);
 static size_t ups2000_read_serial(uint8_t *buf, size_t buf_len);
 static int ups2000_read_registers(modbus_t *ctx, int addr, int nb, uint16_t *dest);
+static int ups2000_read_optional_registers(modbus_t *ctx, int addr, int nb, uint16_t *dest);
 static int ups2000_write_register(modbus_t *ctx, int addr, uint16_t val);
 static int ups2000_write_registers(modbus_t *ctx, int addr, int nb, uint16_t *src);
 static uint16_t crc16(uint8_t *buffer, size_t buffer_length);
@@ -514,22 +519,6 @@ void upsdrv_initinfo(void)
 
 
 /*
- * All registers are uint16_t. But the data they represent can
- * be either an integer or a float. This information is used for
- * error checking (int and float have different invalid values).
- */
-enum {
-	REG_UINT16,
-	REG_UINT32, /* occupies two registers */
-	REG_FLOAT,  /* actually a misnomer, it should really be called
-		       fixed-point number, but we follow the datasheet */
-};
-#define REG_UINT16_INVALID 0xFFFFU
-#define REG_UINT32_INVALID 0xFFFFFFFFU
-#define REG_FLOAT_INVALID  0x7FFFU
-
-
-/*
  * Declare UPS attribute variables, format strings, registers,
  * and their scaling factors in a lookup table to avoid spaghetti
  * code.
@@ -538,27 +527,27 @@ static struct {
 	const char *name;
 	const char *fmt;
 	const uint16_t reg;
-	const int datatype;    /* only UINT32 occupies 2 regs */
+	const enum ups2000_register_datatype datatype; /* only UINT32 occupies 2 regs */
 	const float scaling;   /* scale it down to get the original */
 } ups2000_var[] =
 {
-	{ "input.voltage",          "%03.1f", 1000, REG_FLOAT,  10.0  },
-	{ "input.frequency",        "%02.1f", 1003, REG_FLOAT,  10.0  },
-	{ "input.bypass.voltage",   "%03.1f", 1004, REG_FLOAT,  10.0  },
-	{ "input.bypass.frequency", "%03.1f", 1007, REG_FLOAT,  10.0  },
-	{ "output.voltage",         "%03.1f", 1008, REG_FLOAT,  10.0  },
-	{ "output.current",         "%03.1f", 1011, REG_FLOAT,  10.0  },
-	{ "output.frequency",       "%03.1f", 1014, REG_FLOAT,  10.0  },
-	{ "output.realpower",       "%02.1f", 1015, REG_FLOAT,   0.01 }, /* 10 / 1 kW */
-	{ "output.power",           "%03.1f", 1018, REG_FLOAT,   0.01 }, /* 10 / 1 kVA */
-	{ "ups.load",               "%02.1f", 1021, REG_FLOAT,  10.0  },
-	{ "ups.temperature",        "%02.1f", 1027, REG_FLOAT,  10.0  },
-	{ "battery.voltage",        "%02.1f", 2000, REG_FLOAT,  10.0  },
-	{ "battery.charge",         "%02.1f", 2003, REG_UINT16,  1.0  },
-	{ "battery.runtime",        "%.0f",   2004, REG_UINT32,  1.0  },
-	{ "battery.packs",          "%.0f",   2007, REG_UINT16,  1.0  },
-	{ "battery.capacity",       "%.0f",   2033, REG_UINT16,  1.0  },
-	{ "ups.power.nominal",      "%.0f",   9009, REG_FLOAT,   0.01 }, /* 10 / 1 kVA */
+	{ "input.voltage",          "%03.1f", 1000, UPS2000_REG_FLOAT,  10.0  },
+	{ "input.frequency",        "%02.1f", 1003, UPS2000_REG_FLOAT,  10.0  },
+	{ "input.bypass.voltage",   "%03.1f", 1004, UPS2000_REG_FLOAT,  10.0  },
+	{ "input.bypass.frequency", "%03.1f", 1007, UPS2000_REG_FLOAT,  10.0  },
+	{ "output.voltage",         "%03.1f", 1008, UPS2000_REG_FLOAT,  10.0  },
+	{ "output.current",         "%03.1f", 1011, UPS2000_REG_FLOAT,  10.0  },
+	{ "output.frequency",       "%03.1f", 1014, UPS2000_REG_FLOAT,  10.0  },
+	{ "output.realpower",       "%02.1f", 1015, UPS2000_REG_FLOAT,   0.01 }, /* 10 / 1 kW */
+	{ "output.power",           "%03.1f", 1018, UPS2000_REG_FLOAT,   0.01 }, /* 10 / 1 kVA */
+	{ "ups.load",               "%02.1f", 1021, UPS2000_REG_FLOAT,  10.0  },
+	{ "ups.temperature",        "%02.1f", 1027, UPS2000_REG_FLOAT,  10.0  },
+	{ "battery.voltage",        "%02.1f", 2000, UPS2000_REG_FLOAT,  10.0  },
+	{ "battery.charge",         "%02.1f", 2003, UPS2000_REG_UINT16,  1.0  },
+	{ "battery.runtime",        "%.0f",   2004, UPS2000_REG_UINT32,  1.0  },
+	{ "battery.packs",          "%.0f",   2007, UPS2000_REG_UINT16,  1.0  },
+	{ "battery.capacity",       "%.0f",   2033, UPS2000_REG_UINT16,  1.0  },
+	{ "ups.power.nominal",      "%.0f",   9009, UPS2000_REG_FLOAT,   0.01 }, /* 10 / 1 kVA */
 	{ NULL, NULL, 0, 0, 0 },
 };
 
@@ -566,6 +555,8 @@ static struct {
 static int ups2000_update_info(void)
 {
 	uint16_t reg[3][34];
+	bool battery_page_available;
+	int update_result = UPS2000_UPDATE_OK;
 	int i;
 	int r;
 
@@ -578,22 +569,23 @@ static int ups2000_update_info(void)
 	 */
 	r = ups2000_read_registers(modbus_ctx, 11000, 28, reg[0]);
 	if (r != 28)
-		return 1;
+		return UPS2000_UPDATE_FATAL;
 
-	r = ups2000_read_registers(modbus_ctx, 12000, 34, reg[1]);
-	if (r != 34)
-		return 1;
+	r = ups2000_read_optional_registers(modbus_ctx, 12000, 34, reg[1]);
+	battery_page_available = (r == 34);
+	update_result |= ups2000_classify_battery_page_read(
+		battery_page_available);
 
 	r = ups2000_read_registers(modbus_ctx, 19009, 1, &reg[2][9]);
 	if (r != 1)
-		return 1;
+		return UPS2000_UPDATE_FATAL;
 
 	for (i = 0; ups2000_var[i].name != NULL; i++) {
 		uint16_t reg_id = ups2000_var[i].reg;
 		uint8_t page = (uint8_t)(reg_id / 1000 - 1);
 		uint8_t idx =  (uint8_t)(reg_id % 1000);
 		uint32_t val;
-		bool invalid = 0;
+		enum ups2000_update_result register_result;
 
 		if (page == 8)  /* hack for the lonely register 9009 */
 			page = 2;
@@ -601,30 +593,37 @@ static int ups2000_update_info(void)
 		if (page > 2 || idx > 33)  /* also suppress compiler warn */
 			fatalx(EXIT_FAILURE, "register calculation overflow!\n");
 
+		if (page == 1 && !battery_page_available) {
+			dstate_delinfo(ups2000_var[i].name);
+			continue;
+		}
+
 		switch (ups2000_var[i].datatype) {
-		case REG_FLOAT:
+		case UPS2000_REG_FLOAT:
 			val = reg[page][idx];
-			if (val == REG_FLOAT_INVALID)
-				invalid = 1;
 			break;
-		case REG_UINT16:
+		case UPS2000_REG_UINT16:
 			val = reg[page][idx];
-			if (val == REG_UINT16_INVALID)
-				invalid = 1;
 			break;
-		case REG_UINT32:
+		case UPS2000_REG_UINT32:
 			val  = (uint32_t)(reg[page][idx]) << 16;
 			val |= (uint32_t)(reg[page][idx + 1]);
-			if (val == REG_UINT32_INVALID)
-				invalid = 1;
 			break;
 		default:
 			fatalx(EXIT_FAILURE, "invalid data type in register table!\n");
 		}
 
-		if (invalid) {
+		register_result = ups2000_classify_register_value(reg_id,
+			ups2000_var[i].datatype, true, val);
+		if (register_result == UPS2000_UPDATE_BATTERY_DEGRADED) {
+			dstate_delinfo(ups2000_var[i].name);
+			update_result |= register_result;
+			continue;
+		}
+
+		if (register_result == UPS2000_UPDATE_FATAL) {
 			upslogx(LOG_ERR, "register %04d has invalid value %04x,", reg_id, val);
-			return 1;
+			return UPS2000_UPDATE_FATAL;
 		}
 
 #ifdef HAVE_PRAGMAS_FOR_GCC_DIAGNOSTIC_IGNORED_FORMAT_NONLITERAL
@@ -642,7 +641,7 @@ static int ups2000_update_info(void)
 #pragma GCC diagnostic pop
 #endif
 	}
-	return 0;
+	return update_result;
 }
 
 
@@ -714,24 +713,38 @@ static struct {
 
 static int ups2000_update_status(void)
 {
+	int update_result = UPS2000_UPDATE_OK;
 	int i, j;
 	int r;
 
 	upsdebugx(2, "ups2000_update_status");
 
 	for (i = 0; ups2000_status_reg[i].reg != 0; i++) {
-		uint16_t reg, val;
+		uint16_t reg, val = 0;
 		struct flags_t *flag;
+		enum ups2000_update_result register_result;
 		int flag_count = 0;
 
 		reg = ups2000_status_reg[i].reg;
-		r = ups2000_read_registers(modbus_ctx, reg + 10000, 1, &val);
-		if (r != 1)
-			return 1;
+		if (ups2000_is_optional_battery_register(reg))
+			r = ups2000_read_optional_registers(modbus_ctx,
+				reg + 10000, 1, &val);
+		else
+			r = ups2000_read_registers(modbus_ctx,
+				reg + 10000, 1, &val);
 
-		if (val == REG_UINT16_INVALID) {
-			upslogx(LOG_ERR, "register %04d has invalid value %04x,", reg, val);
-			return 1;
+		register_result = ups2000_classify_register_value(reg,
+			UPS2000_REG_UINT16, r == 1, val);
+		if (register_result == UPS2000_UPDATE_BATTERY_DEGRADED) {
+			dstate_delinfo("battery.charger.status");
+			update_result |= register_result;
+			continue;
+		}
+
+		if (register_result == UPS2000_UPDATE_FATAL) {
+			if (r == 1)
+				upslogx(LOG_ERR, "register %04d has invalid value %04x,", reg, val);
+			return UPS2000_UPDATE_FATAL;
 		}
 
 		flag = ups2000_status_reg[i].flags;
@@ -752,12 +765,17 @@ static int ups2000_update_status(void)
 			}
 		}
 		if (ups2000_status_reg[i].must_set_flag && flag_count == 0) {
+			if (ups2000_is_optional_battery_register(reg)) {
+				dstate_delinfo("battery.charger.status");
+				update_result |= UPS2000_UPDATE_BATTERY_DEGRADED;
+				continue;
+			}
 			upslogx(LOG_ERR, "register %04d has invalid value %04x,", reg, val);
-			return 1;
+			return UPS2000_UPDATE_FATAL;
 		}
 	}
 
-	return 0;
+	return update_result;
 }
 
 
@@ -1101,6 +1119,9 @@ static int ups2000_update_alarm(void)
 void upsdrv_updateinfo(void)
 {
 	int err = 0;
+	int update_result;
+	bool battery_degraded = false;
+	enum ups2000_battery_transition battery_transition;
 
 	upsdebugx(2, "upsdrv_updateinfo");
 	status_init();
@@ -1108,8 +1129,17 @@ void upsdrv_updateinfo(void)
 
 	err += ups2000_update_timers();
 	err += ups2000_update_alarm();
-	err += ups2000_update_info();
-	err += ups2000_update_status();
+
+	update_result = ups2000_update_info();
+	err += (update_result & UPS2000_UPDATE_FATAL) != 0;
+	battery_degraded =
+		(update_result & UPS2000_UPDATE_BATTERY_DEGRADED) != 0;
+
+	update_result = ups2000_update_status();
+	err += (update_result & UPS2000_UPDATE_FATAL) != 0;
+	battery_degraded = battery_degraded ||
+		(update_result & UPS2000_UPDATE_BATTERY_DEGRADED) != 0;
+
 	err += ups2000_update_rw_var();
 
 	if (err > 0) {
@@ -1117,6 +1147,14 @@ void upsdrv_updateinfo(void)
 		dstate_datastale();
 		return;
 	}
+
+	battery_transition = ups2000_battery_transition(
+		battery_data_degraded, battery_degraded);
+	if (battery_transition == UPS2000_BATTERY_TRANSITION_DEGRADED)
+		upslogx(LOG_WARNING, "Battery data is degraded; unavailable values were removed.");
+	else if (battery_transition == UPS2000_BATTERY_TRANSITION_RECOVERED)
+		upslogx(LOG_INFO, "Battery data has recovered.");
+	battery_data_degraded = battery_degraded;
 
 	alarm_commit();
 	status_commit();
@@ -1535,11 +1573,11 @@ static int ups2000_instcmd_load_on(const uint16_t reg)
 	/* force refresh UPS status */
 	status_init();
 	r = ups2000_update_status();
-	if (r != 0) {
+	if (r & UPS2000_UPDATE_FATAL) {
 		/*
 		 * When the UPS status is updated, the code must set either OL, OB, OL ECO,
 		 * BYPASS, or OFF. These five options are mutually exclusive. If the register
-		 * value is invalid and set none of these flags, failure code 1 is returned.
+		 * value is invalid and sets none of these flags, the result is fatal.
 		 */
 		dstate_datastale();
 		return STAT_INSTCMD_FAILED;
@@ -1569,7 +1607,7 @@ static int ups2000_instcmd_load_on(const uint16_t reg)
 		return STAT_INSTCMD_FAILED;
 	}
 	else {
-		/* unreachable, see comments for r != 0 at the beginning */
+		/* unreachable, see the fatal-status check at the beginning */
 		upslogx(LOG_ERR, "load.on error: invalid ups.status (%s) detected. "
 				 "Please file a bug report!", status);
 		return STAT_INSTCMD_FAILED;
@@ -1996,6 +2034,15 @@ static int ups2000_read_registers(modbus_t *ctx, int addr, int nb, uint16_t *des
 	upslogx(LOG_ERR, "Register %04d has a fatal read failure.", addr);
 	retry_status = RETRY_DISABLE_TEMPORARY;
 	return r;
+}
+
+
+static int ups2000_read_optional_registers(modbus_t *ctx, int addr, int nb,
+	uint16_t *dest)
+{
+	/* A battery-only fault must not delay fresh safety status with retries. */
+	modbus_flush(ctx);
+	return modbus_read_registers(ctx, addr, nb, dest);
 }
 
 

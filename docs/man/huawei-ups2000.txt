@@ -302,27 +302,39 @@ equivalent of *ondelay*. See description of *ondelay*.
 KNOWN ISSUES AND BUGS
 ---------------------
 
-Battery status has a non-fatal read failure
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Battery telemetry is unavailable
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-It's usually harmless and can be safely ignored. It's only logged for
-informative purposes (*LOG_INFO*), not as a warning or error.
+Invalid or unreadable battery voltage, charge, runtime, pack count, capacity,
+or charger-state values are removed from the exported data until a valid
+reading is available again. Charger-state failures also omit the *CHRG* and
+*DISCHRG* status words; they do not change the independently read power source.
+The driver logs a warning when battery data becomes degraded and an
+informational message when it recovers, rather than repeating the warning
+on every poll.
+
+These battery-only failures do not make the entire UPS data set stale when
+the power-route register (1024), safety-status register (1043), alarm data,
+and other required readings remain valid. *OL*, *OB*, *CAL*, *LB*, and UPS
+alarms continue to be published from their own registers. This behavior does
+not clear battery alarms or replace missing readings with estimated values.
+Battery faults still require maintenance.
 
 Data stale
 ~~~~~~~~~~~
 
-Under certain circumstances, some registers can return invalid values
-and trigger a "data stale" error. Once a data stale error has occurred,
+Required registers can return invalid values or fail to respond and
+trigger a "data stale" error. Once a data stale error has occurred,
 you should see error messages similar to the example below in the system
 log.
 
-    huawei-ups2000: register 2002 has invalid value a000,
+    huawei-ups2000: register 1024 has invalid value ffff,
     upsd: Data for UPS [huawei] is stale - check driver
     upsd: UPS [huawei] data is no longer stale
 
-So far all known problems have been fixed by the author, but an unknown one
-cannot be ruled out. If you have encountered "data stale" problems during
-normal uses, please file a bug report with full logs attached.
+Failures of the power-route or safety-status registers, alarm reads, or the
+communication link still make the data stale. If you encounter "data stale"
+problems during normal use, include the complete driver logs in the report.
 
 Before troubleshooting or reporting a problem, it's important to check
 your *dmesg* log for USB connect and disconnect events to avoid wasting
