@@ -74,6 +74,56 @@ jobs:
       - name: Run the complete configured test suite
         run: make check
 
+      - name: Build the production-compatible driver artifact
+        run: |
+          production_build="$RUNNER_TEMP/nut-production-build"
+          production_artifact="$RUNNER_TEMP/nut-production-artifact"
+          git clone --shared --no-checkout "$GITHUB_WORKSPACE" "$production_build"
+          git -C "$production_build" checkout --detach "$GITHUB_SHA"
+          cd "$production_build"
+          ./autogen.sh
+          ./configure \
+            --with-drivers=huawei-ups2000 \
+            --with-modbus \
+            --with-user=nut \
+            --with-group=nut \
+            --datadir=/usr/share/nut \
+            --sysconfdir=/etc/nut \
+            --includedir=/usr/include \
+            --with-statepath=/run/nut \
+            --with-pidpath=/run/nut \
+            --with-altpidpath=/run/nut \
+            --with-drvpath=/lib/nut \
+            --with-udev-dir=/lib/udev \
+            --with-systemdsystemunitdir=/lib/systemd/system \
+            --with-systemdshutdowndir=/lib/systemd/system-shutdown \
+            --without-doc
+          make -j2 -C drivers huawei-ups2000
+          make -j2 -C tests huawei-ups2000-test huawei-ups2000-driver-test
+          ./tests/huawei-ups2000-test
+          ./tests/huawei-ups2000-driver-test
+          install -d "$production_artifact"
+          install -m 0755 drivers/huawei-ups2000 "$production_artifact/huawei-ups2000"
+          file "$production_artifact/huawei-ups2000" | grep 'ELF 64-bit'
+          "$production_artifact/huawei-ups2000" -V > "$production_artifact/VERSION.txt" 2>&1
+          grep -F '0.06-cdryzun1' "$production_artifact/VERSION.txt"
+          ldd "$production_artifact/huawei-ups2000" > "$production_artifact/DEPENDENCIES.txt"
+          if grep -F 'not found' "$production_artifact/DEPENDENCIES.txt"; then exit 1; fi
+          git rev-parse HEAD > "$production_artifact/SOURCE_COMMIT.txt"
+          ./config.status --config > "$production_artifact/CONFIGURE_ARGS.txt"
+          cd "$production_artifact"
+          sha256sum huawei-ups2000 VERSION.txt DEPENDENCIES.txt SOURCE_COMMIT.txt CONFIGURE_ARGS.txt \
+            > SHA256SUMS
+          tar -czf "$RUNNER_TEMP/huawei-ups2000-ubuntu22.04-amd64.tar.gz" \
+            huawei-ups2000 VERSION.txt DEPENDENCIES.txt SOURCE_COMMIT.txt CONFIGURE_ARGS.txt SHA256SUMS
+
+      - name: Retain the validated production artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: huawei-ups2000-production-ubuntu22.04-amd64
+          if-no-files-found: error
+          path: ${{ runner.temp }}/huawei-ups2000-ubuntu22.04-amd64.tar.gz
+
       - name: Retain verification logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
